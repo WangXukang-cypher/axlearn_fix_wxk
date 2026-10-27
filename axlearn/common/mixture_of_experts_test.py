@@ -1341,16 +1341,39 @@ class TopKGatingTest(TestCase):
         gate_1_combine_tensor = jnp.asarray(gate_1.combine_tensor).astype(jnp.float32)
         assert jnp.array_equal(gate_0_combine_tensor, gate_1_combine_tensor)
 
-    def test_zero_score_fn_produces_finite_combine_tensor(self):
+    def test_normalized_gates_preserve_nonzero_sums(self):
         cfg = TopKGating.default_config().set(
             name="test",
-            score_fn=config_for_function(zero_score_fn),
+            score_fn=config_for_function(sigmoid),
+            num_experts=4,
+        )
+        layer: TopKGating = cfg.instantiate(parent=None)
+        raw_gates = jnp.array(
+            [[0, 0, 0, 0], [1e-11, 1e-11, 1e-11, 1e-11], [0.1, 0.2, 0.3, 0.4]],
+            dtype=jnp.float32,
+        )
+        expected = jnp.array(
+            [[0, 0, 0, 0], [0.25, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]],
+            dtype=jnp.float32,
+        )
+        self.assertNestedAllClose(layer._get_normalized_gates(raw_gates), expected)
+
+    @parameterized.named_parameters(
+        ("zero", zero_score_fn, 0.0, 0.0),
+        ("small_positive", sigmoid, -25.0, 0.5),
+        ("positive", sigmoid, 0.0, 0.5),
+    )
+    def test_gate_normalization(self, score_fn, logit: float, expected_weight: float):
+        cfg = TopKGating.default_config().set(
+            name="test",
+            score_fn=config_for_function(score_fn),
             num_experts=4,
             num_experts_per_token=2,
+            expert_capacity=8,
         )
         layer: TopKGating = cfg.instantiate(parent=None)
         state = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
-        logits = jnp.zeros((1, 2, 8, 4), dtype=jnp.float32)
+        logits = jnp.full((1, 2, 8, 4), logit, dtype=jnp.float32)
 
         output, _ = F(
             layer,
@@ -1363,20 +1386,30 @@ class TopKGatingTest(TestCase):
         self.assertTrue(bool(jnp.isfinite(output.combine_tensor).all()))
         self.assertTrue(bool(jnp.isfinite(output.dispatch_tensor).all()))
         self.assertTrue(bool(jnp.isfinite(output.load_balance_loss)))
-        self.assertNestedAllClose(output.combine_tensor, jnp.zeros_like(output.combine_tensor))
+        self.assertNestedAllClose(output.combine_tensor, output.dispatch_tensor * expected_weight)
+        self.assertNestedAllClose(
+            output.combine_tensor.sum(axis=(-2, -1)),
+            jnp.full(logits.shape[:-1], 2 * expected_weight),
+        )
+        self.assertNestedAllClose(output.load_balance_loss, 2 * expected_weight)
 
 
 class TopKDropFreeGatingTest(TestCase):
-    def test_zero_score_fn_produces_finite_expert_weights(self):
+    @parameterized.named_parameters(
+        ("zero", zero_score_fn, 0.0, 0.0),
+        ("small_positive", sigmoid, -25.0, 0.5),
+        ("positive", sigmoid, 0.0, 0.5),
+    )
+    def test_gate_normalization(self, score_fn, logit: float, expected_weight: float):
         cfg = TopKDropFreeGating.default_config().set(
             name="test",
-            score_fn=config_for_function(zero_score_fn),
+            score_fn=config_for_function(score_fn),
             num_experts=4,
             num_experts_per_token=2,
         )
         layer: TopKDropFreeGating = cfg.instantiate(parent=None)
         state = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
-        logits = jnp.zeros((2, 8, 4), dtype=jnp.float32)
+        logits = jnp.full((2, 8, 4), logit, dtype=jnp.float32)
 
         output, _ = F(
             layer,
@@ -1388,15 +1421,27 @@ class TopKDropFreeGatingTest(TestCase):
 
         self.assertTrue(bool(jnp.isfinite(output.expert_weights).all()))
         self.assertTrue(bool(jnp.isfinite(output.load_balance_loss)))
-        self.assertNestedAllClose(output.expert_weights, jnp.zeros_like(output.expert_weights))
+        self.assertNestedAllClose(
+            output.expert_weights, jnp.full_like(output.expert_weights, expected_weight)
+        )
+        self.assertNestedAllClose(output.load_balance_loss, 2 * expected_weight)
 
 
 class TopKBiasGatingTest(TestCase):
-    @parameterized.parameters(False, True)
-    def test_zero_score_fn_produces_finite_expert_weights(self, use_group_routing: bool):
+    @parameterized.named_parameters(
+        ("zero", False, zero_score_fn, 0.0, 0.0),
+        ("small_positive", False, sigmoid, -25.0, 0.5),
+        ("positive", False, sigmoid, 0.0, 0.5),
+        ("group_zero", True, zero_score_fn, 0.0, 0.0),
+        ("group_small_positive", True, sigmoid, -25.0, 0.5),
+        ("group_positive", True, sigmoid, 0.0, 0.5),
+    )
+    def test_gate_normalization(
+        self, use_group_routing: bool, score_fn, logit: float, expected_weight: float
+    ):
         cfg = TopKBiasGating.default_config().set(
             name="test",
-            score_fn=config_for_function(zero_score_fn),
+            score_fn=config_for_function(score_fn),
             num_experts=4,
             num_experts_per_token=2,
             routed_scaling_factor=1,
@@ -1407,7 +1452,7 @@ class TopKBiasGatingTest(TestCase):
 
         layer: TopKBiasGating = cfg.instantiate(parent=None)
         state = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
-        logits = jnp.zeros((2, 8, 4), dtype=jnp.float32)
+        logits = jnp.full((2, 8, 4), logit, dtype=jnp.float32)
 
         output, _ = F(
             layer,
@@ -1419,7 +1464,10 @@ class TopKBiasGatingTest(TestCase):
 
         self.assertTrue(bool(jnp.isfinite(output.expert_weights).all()))
         self.assertTrue(bool(jnp.isfinite(output.load_balance_loss)))
-        self.assertNestedAllClose(output.expert_weights, jnp.zeros_like(output.expert_weights))
+        self.assertNestedAllClose(
+            output.expert_weights, jnp.full_like(output.expert_weights, expected_weight)
+        )
+        self.assertNestedAllClose(output.load_balance_loss, 2 * expected_weight)
 
 
 class TransformerFeedForwardDropFreeMoETest(TestCase):
